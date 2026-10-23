@@ -1,0 +1,9 @@
+target/
+.DS_Store
+.classpath
+.project
+.settings/
+.vscode/
+*.mp4
+*.mov
+*.mkv
