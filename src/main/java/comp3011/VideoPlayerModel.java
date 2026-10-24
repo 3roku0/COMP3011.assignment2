@@ -4,8 +4,7 @@
  * 
  * Authors:
  *   1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
- *   2. <student name and student number insert here upon modification>
- *
+ *   2. Zarni Htet Khaing (a1807729)
  * Copyright 2026 Simon Ratcliffe
  */
 package comp3011;
@@ -91,6 +90,7 @@ public class VideoPlayerModel {
 
     public VideoPlayerModel(
             boolean audioEnabled,
+            List<FrameProcessorOption> frameProcessorOptions,
             BiConsumer<Integer, Integer> videoSizeChangedHandler,
             Consumer<Image> frameReadyHandler,
             Consumer<String> statusChangedHandler,
@@ -102,17 +102,14 @@ public class VideoPlayerModel {
         this.statusChangedHandler = statusChangedHandler;
         this.playbackStateChangedHandler = playbackStateChangedHandler;
         this.audioOutputStateChangedHandler = audioOutputStateChangedHandler;
-        this.frameProcessors = new ArrayList<>();
-//        frameProcessors.add(new FrameBleeder());
-//        frameProcessors.add(new FrameScratcher());
-//        frameProcessors.add(new FrameDuster());
-//        frameProcessors.add(new FramePepperer());
-//        frameProcessors.add(new FrameBlackAndWhiter());
-//        frameProcessors.add(new FrameYellower());
-//        frameProcessors.add(new FrameVignetter());
-//        frameProcessors.add(new FrameFlickerer());
-//        frameProcessors.add(new FrameJitterer());
-//        frameProcessors.add(new FrameNumberer());
+        // one new processor per flag, built here once and in order. processors number
+        // themselves as they're built and use that as their random seed, so -ss gets two
+        // different scratch patterns. see FrameProcessorOption
+        List<FrameProcessor> processors = new ArrayList<>(frameProcessorOptions.size());
+        for (FrameProcessorOption option : frameProcessorOptions) {
+            processors.add(option.createProcessor());
+        }
+        this.frameProcessors = List.copyOf(processors);
     }
 
     public void play(File file) {
