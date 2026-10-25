@@ -5,6 +5,10 @@
  * Authors:
  *   1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
  *   2. Zarni Htet Khaing (a1807729)
+ *      - builds its frame processors from the command line instead of a hard coded list
+ *      - decoding, effects and image conversion moved off the JavaFX thread into PlaybackPipeline,
+ *        this class keeps the clock, audio timing and display. old single threaded frame code removed
+ *
  * Copyright 2026 Simon Ratcliffe
  */
 package comp3011;
@@ -18,23 +22,33 @@ import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
 import org.bytedeco.javacv.FFmpegFrameGrabber;
-import org.bytedeco.javacv.Frame;
 import org.bytedeco.javacv.FrameGrabber;
-import org.bytedeco.javacv.JavaFXFrameConverter;
 
 import javafx.animation.AnimationTimer;
-import javafx.application.Platform;
 import javafx.scene.image.Image;
 
 /**
  * The model part of the video player model-view-controller architecture.
  *
  * <p>
- * Owns the FFmpeg decoder, playback clock, seeking logic, audio scheduling,
- * and frame processing - which it all manages through cooperative multi-tasking
- * on a single thread. It publishes decoded frames and playback state through
- * callbacks supplied by its owning {@link VideoPlayerController}, keeping it
- * decoupled from the JavaFX view.
+ * Owns the FFmpeg decoder, playback clock, seeking logic, audio scheduling and the frame processors (one
+ * new one per effect flag from the command line, in that order). It publishes frames and playback state
+ * through callbacks supplied by its owning {@link VideoPlayerController}, keeping it decoupled from the
+ * JavaFX view.
+ * </p>
+ *
+ * <p>
+ * Threads: every method here runs on the JavaFX Application Thread and every field is only touched by
+ * that thread, so nothing here needs locks. The heavy per frame work (decode, effects, convert to an
+ * Image) happens on worker threads in a {@link PlaybackPipeline}, and this class only talks to it through
+ * the pipelines queues. Its job each pulse is small, write whatever sound is due and put the next frame
+ * up when its time comes. See PlaybackPipeline for the full design and why theres no races or deadlocks.
+ * </p>
+ *
+ * <p>
+ * The one thing that gets lent out is the grabber. While a pipeline is running its decoder thread is the
+ * only thing that uses it. This class only touches the grabber when no pipeline is running, i.e. after
+ * stopPipeline() has waited for the decoder thread to finish.
  * </p>
  */
 public class VideoPlayerModel {
@@ -67,15 +81,12 @@ public class VideoPlayerModel {
 
     private File videoFile; // Path to the media that comes from the command line
     private FFmpegFrameGrabber grabber; // This is the 3rd party video media decoder. It deals in JavaCV Frame objects.
-    private JavaFXFrameConverter converter; // Takes Frame objects to JavaFX Image objects, which can be put on screen.
     private AudioPlayer audioPlayer; // This is ours. It has some real time buffering smarts.
-    private PreparedFrame preparedFrame; // Ours, but is just an Image with some meta-data added.
-    private boolean prepareNextFrameQueued; // True only when the event loop needs to call our prepareNextFrame method.
+    private PlaybackPipeline pipeline; // the worker threads making frames, null when playback isn't open
     private boolean playbackOpen; // True when playback is happening.
     private boolean pauseRequested;
     private boolean audioOutputEnabled;
     private boolean audioAvailable;
-    private boolean frameProcessorsInitialised;
     private long currentTimestampUs;
     private long videoDurationUs = NO_SEEK_REQUEST;
     private int videoFrameDurationUs;
@@ -102,6 +113,7 @@ public class VideoPlayerModel {
         this.statusChangedHandler = statusChangedHandler;
         this.playbackStateChangedHandler = playbackStateChangedHandler;
         this.audioOutputStateChangedHandler = audioOutputStateChangedHandler;
+
         // one new processor per flag, built here once and in order. processors number
         // themselves as they're built and use that as their random seed, so -ss gets two
         // different scratch patterns. see FrameProcessorOption
@@ -158,7 +170,9 @@ public class VideoPlayerModel {
 
     public void toggleAudioOutput() {
         audioOutputEnabled = !audioOutputEnabled;
-        pendingAudio.clear();
+        // original cleared the queued audio here. doesn't work anymore, the decoder runs ahead of the picture
+        // now so clearing would leave a gap of silence after unmuting. instead keep the queue and
+        // writeDueAudio() just skips audio that comes due while muted
         flushAudioOutput();
         notifyAudioOutputStateChanged();
     }
@@ -201,10 +215,14 @@ public class VideoPlayerModel {
         }
 
         try {
+            // decoder thread is the only one allowed to use the grabber while the pipeline runs, so stop the
+            // pipeline (waits for that thread) BEFORE moving the grabber. frames already in it are from the old
+            // position and get thrown away with it
+            stopPipeline();
             grabber.setTimestamp(grabTimestampUs);
             resetPlaybackClock(logicalTimestampUs);
             flushAudioOutput();
-            prepareNextFrame();
+            startPipeline();
             notifyPlaybackStateChanged();
         } catch (Exception e) {
             handlePlaybackError(e);
@@ -227,7 +245,7 @@ public class VideoPlayerModel {
             resetPlaybackClock(currentTimestampUs);
             playbackOpen = true;
             playbackTimer.start();
-            prepareNextFrame();
+            startPipeline();
             notifyPlaybackStateChanged();
         } catch (Exception e) {
             handlePlaybackError(e);
@@ -235,7 +253,6 @@ public class VideoPlayerModel {
     }
 
     private void openPlaybackResources(long startTimestampUs) throws Exception {
-        converter = new JavaFXFrameConverter();
         grabber = new FFmpegFrameGrabber(videoFile);
         grabber.setImageMode(FrameGrabber.ImageMode.COLOR);
         grabber.setSampleMode(FrameGrabber.SampleMode.SHORT);
@@ -266,9 +283,47 @@ public class VideoPlayerModel {
         }
     }
 
+    // starts a new pipeline reading from wherever the grabber is now. this thread can't touch the grabber
+    // again until stopPipeline()
+    private void startPipeline() {
+        // copied into locals so the decoder thread makes InfoVideo from values fixed right now, not from fields
+        // this thread might change later
+        String mediaName = mediaName(videoFile);
+        int videoFrameCount = totalVideoFrames;
+        double videoFrameRate = frameRate;
+        int roundedFrameRate = intFrameRate;
+        int frameDurationUs = videoFrameDurationUs;
+        FFmpegFrameGrabber decoderGrabber = grabber;
+
+        pipeline = new PlaybackPipeline(
+                grabber,
+                audioAvailable ? audioPlayer : null,
+                frame -> new InfoVideo(
+                        mediaName,
+                        videoFrameCount,
+                        frame.imageWidth,
+                        frame.imageHeight,
+                        frame.imageDepth,
+                        frame.imageChannels,
+                        frame.imageStride,
+                        videoFrameRate,
+                        roundedFrameRate,
+                        frameDurationUs,
+                        decoderGrabber.getPixelFormat()), // runs on the decoder thread, which owns the grabber now
+                frameProcessors);
+        pipeline.start();
+    }
+
+    // stops the worker threads and waits for them, after this its safe to use the grabber again
+    private void stopPipeline() {
+        if (pipeline != null) {
+            pipeline.stop();
+            pipeline = null;
+        }
+    }
+
     private void resetPlaybackClock(long logicalTimestampUs) {
         pendingAudio.clear();
-        preparedFrame = null;
         currentTimestampUs = logicalTimestampUs;
         relativeSeekBaseUs = logicalTimestampUs;
         firstTimestampUs = NO_SEEK_REQUEST;
@@ -284,126 +339,53 @@ public class VideoPlayerModel {
         pauseStartedNs = 0;
     }
 
-    private void prepareNextFrame() {
-        if (!playbackOpen || preparedFrame != null) {
-            return;
-        }
-
-        try {
-            preparedFrame = readNextVideoFrame();
-        } catch (Exception e) {
-            handlePlaybackError(e);
-        }
-    }
-
-    private PreparedFrame readNextVideoFrame() throws Exception {
-        while (playbackOpen) {
-            Frame frame = grabFrame();
-            if (frame == null) {
-                finishPlayback();
-                return null;
-            }
-
-            long timestampUs = grabber.getTimestamp();
-            if (audioAvailable && frame.samples != null) {
-                queueAudio(timestampUs, frame);
-            }
-
-            if (frame.image == null) {
-                continue;
-            }
-
-            if (!frameProcessorsInitialised) {
-                initialiseFrameProcessors(new InfoVideo(
-                        mediaName(videoFile),
-                        totalVideoFrames,
-                        frame.imageWidth,
-                        frame.imageHeight,
-                        frame.imageDepth,
-                        frame.imageChannels,
-                        frame.imageStride,
-                        frameRate,
-                        intFrameRate,
-                        videoFrameDurationUs,
-                        grabber.getPixelFormat()));
-                frameProcessorsInitialised = true;
-            }
-
-            if (firstTimestampUs == NO_SEEK_REQUEST) {
-                firstTimestampUs = timestampUs;
-                playbackStartNs = System.nanoTime();
-                if (pauseRequested) {
-                    pauseStartedNs = playbackStartNs;
-                }
-            }
-
-            int frameNumber = grabber.getFrameNumber();
-            InfoFrame info = new InfoFrame(frameNumber, timestampUs);
-            processFrame(frame, info);
-
-            Image image = converter.convert(frame);
-            long relativeTimestampUs = Math.max(0, timestampUs - firstTimestampUs);
-            long logicalTimestampUs = logicalPlaybackBaseUs + relativeTimestampUs;
-            long targetTimeNs = playbackStartNs + relativeTimestampUs * 1_000L;
-
-            return new PreparedFrame(
-                    image,
-                    frameNumber,
-                    timestampUs,
-                    logicalTimestampUs,
-                    targetTimeNs,
-                    System.nanoTime());
-        }
-
-        return null;
-    }
-
-    // This is called on a heart beat by the GUI thread. We want to be co-operative here by (a) not blocking, and (b)
-    // getting our required work out of the way quickly so that we can return control flow to the JavaFX event loop for
-    // handling user interaction with the GUI and rendering. We have three jobs: (1) keep audio flowing if sound is on,
-    // (2) display a frame if it is due and (3) prepare the next frame if we're in the window after the previous frame
-    // has gone to the display. We don't buffer frames here, just handling them one at a time. Not a great architecture,
-    // living on the edge a bit, but can't do much better on a single thread.
+    // JavaFX calls this every pulse (~60 times a sec) on the JavaFX Application Thread. heavy stuff is in the
+    // pipeline now so this just has 2 quick jobs, keep the sound going and put the next frame up when its due.
+    // never waits on the pipeline, only looks at whats already arrived, so a slow effect can make a frame late
+    // but can't freeze the window
     private void pumpPlayback(long now) {
         if (!playbackOpen) {
             return;
         }
 
-        // Task (1)
         writeDueAudio(now);
 
-        // Task (2)
-        if (preparedFrame != null && preparedFrame.targetTimeNs() <= now) {
-            // We have a prepared frame ready to go and it is due (or just past due!) so get it up on screen ASAP!
-            displayPreparedFrame(now);
-        }
-
-        // Task (3). We'll try and be nice to the GUI event loop here by queueing the prepareNextFrame call rather than
-        // hogging the thread and doing it here, hence the tricky callback and use of prepareNextFrameQueued. Feel free
-        // to replace this whole block with simple linear control flow logic
-        // such as: if (!pauseRequested && preparedFrame == null) prepareNextFrame();
-        // to compare.
-        if (!pauseRequested && preparedFrame == null && !prepareNextFrameQueued) {
-            prepareNextFrameQueued = true;
-            Platform.runLater(() -> {
-                prepareNextFrameQueued = false;
-
-                if (!pauseRequested) {
-                    prepareNextFrame();
-                }
-            });
+        PipelineMessage next = pipeline.peekDisplay();
+        if (next instanceof PipelineMessage.DisplayableFrame frame) {
+            showFrameIfDue(frame, now);
+        } else if (next instanceof PipelineMessage.EndOfStream) {
+            finishPlayback(); // only gets here after every frame before it was shown
+        } else if (next instanceof PipelineMessage.Failure failure) {
+            handlePlaybackError(failure.cause());
         }
     }
 
-    private void displayPreparedFrame(long now) {
-        PreparedFrame frame = preparedFrame;
-        preparedFrame = null;
-        currentTimestampUs = frame.logicalTimestampUs();
+    private void showFrameIfDue(PipelineMessage.DisplayableFrame frame, long now) {
+        if (firstTimestampUs == NO_SEEK_REQUEST) {
+            // first frame since play/seek starts the clock and gets shown straight away even if paused, so
+            // seeking while paused still updates the picture like the original did
+            firstTimestampUs = frame.timestampUs();
+            playbackStartNs = System.nanoTime();
+            if (pauseRequested) {
+                pauseStartedNs = playbackStartNs;
+            }
+        } else if (pauseRequested || targetTimeNs(frame) > now) {
+            return; // not due yet, leave it at the front for a later pulse
+        }
+
+        pipeline.removeDisplayHead();
+        displayFrame(frame);
+    }
+
+    private void displayFrame(PipelineMessage.DisplayableFrame frame) {
+        long targetTimeNs = targetTimeNs(frame);
+        currentTimestampUs = logicalPlaybackBaseUs + Math.max(0, frame.timestampUs() - firstTimestampUs);
         relativeSeekBaseUs = NO_SEEK_REQUEST;
 
         // Dump some logging to the console once per second so that real time performance can be monitored.
+        // headroom = how long before its display time the frame came out of the pipeline ready
         if (intFrameRate > 0 && frame.frameNumber() % intFrameRate == 0) {
-            long remainingUs = (frame.targetTimeNs() - frame.preparedAtNs()) / 1_000L;
+            long remainingUs = (targetTimeNs - frame.readyAtNs()) / 1_000L;
             if (remainingUs < 0) {
                 System.out.printf("Frame headroom is \u001B[31m%5dus\u001B[0m out of %dus spare.%n",
                         remainingUs,
@@ -418,20 +400,16 @@ public class VideoPlayerModel {
         notifyFrameReady(frame.image());
     }
 
-    private void queueAudio(long timestampUs, Frame frame) {
-        if (!audioOutputEnabled || audioPlayer == null) {
-            return;
-        }
-
-        byte[] samples = audioPlayer.copySamples(frame);
-        if (samples.length > 0) {
-            pendingAudio.add(new PendingAudio(timestampUs, samples));
-        }
+    private long targetTimeNs(PipelineMessage.DisplayableFrame frame) {
+        long relativeTimestampUs = Math.max(0, frame.timestampUs() - firstTimestampUs);
+        return playbackStartNs + relativeTimestampUs * 1_000L;
     }
 
     private void writeDueAudio(long now) {
+        takeDecodedAudio();
+
         // Handle some obvious early exits
-        if (!audioOutputEnabled || audioPlayer == null) {
+        if (audioPlayer == null) {
             pendingAudio.clear();
             return;
         }
@@ -447,6 +425,11 @@ public class VideoPlayerModel {
                 return;
             }
 
+            if (!audioOutputEnabled) {
+                pendingAudio.remove(); // muted, skip it so unmuting carries on in sync
+                continue;
+            }
+
             int written = audioPlayer.write(audio.samples(), audio.offset(), audio.remaining());
             if (written <= 0) {
                 return;
@@ -457,6 +440,15 @@ public class VideoPlayerModel {
                 return;
             }
             pendingAudio.remove();
+        }
+    }
+
+    // moves sound from the decoder onto this threads own queue, where how much has been written (offset)
+    // gets tracked without sharing anything
+    private void takeDecodedAudio() {
+        DecodedAudio decoded;
+        while ((decoded = pipeline.pollAudio()) != null) {
+            pendingAudio.add(new PendingAudio(decoded.timestampUs(), decoded.samples()));
         }
     }
 
@@ -483,14 +475,17 @@ public class VideoPlayerModel {
 
     private void closePlaybackResources() {
         playbackTimer.stop();
+
+        // stop the pipeline first, it waits for the decoder thread to finish so nothing is still inside the
+        // native decoder when the grabber gets closed below. closing it mid grab would free memory its using
+        stopPipeline();
+
         playbackOpen = false;
-        preparedFrame = null;
         pendingAudio.clear();
         firstTimestampUs = NO_SEEK_REQUEST;
         playbackStartNs = 0;
         pauseStartedNs = 0;
         audioAvailable = false;
-        frameProcessorsInitialised = false;
 
         if (audioPlayer != null) {
             audioPlayer.close();
@@ -509,11 +504,6 @@ public class VideoPlayerModel {
                 // The resource is being closed; there is no useful recovery action.
             }
             grabber = null;
-        }
-
-        if (converter != null) {
-            converter.close();
-            converter = null;
         }
     }
 
@@ -549,25 +539,6 @@ public class VideoPlayerModel {
         return Math.max(0, durationUs - frameDurationUs);
     }
 
-    private void processFrame(Frame frame, InfoFrame info) throws Exception {
-        for (FrameProcessor processor : frameProcessors) {
-            processor.process(frame, info);
-        }
-    }
-
-    private void initialiseFrameProcessors(InfoVideo videoInfo) throws Exception {
-        for (FrameProcessor processor : frameProcessors) {
-            processor.initialise(videoInfo);
-        }
-    }
-
-    private Frame grabFrame() throws Exception {
-        if (audioAvailable) {
-            return grabber.grab();
-        }
-        return grabber.grabImage();
-    }
-
     private void flushAudioOutput() {
         if (audioPlayer != null) {
             audioPlayer.flush();
@@ -592,15 +563,6 @@ public class VideoPlayerModel {
 
     private void notifyAudioOutputStateChanged() {
         audioOutputStateChangedHandler.accept(audioOutputEnabled);
-    }
-
-    private record PreparedFrame(
-            Image image,
-            int frameNumber,
-            long mediaTimestampUs,
-            long logicalTimestampUs,
-            long targetTimeNs,
-            long preparedAtNs) {
     }
 
     private static class PendingAudio {
